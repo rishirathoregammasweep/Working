@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Document</title>
+  <script src="gammaengage-sdk.js"></script>
+</head>
+<body>
+</body>
+<script>
+  function init() {
+    window.gammaengageSDK.init({
+      tenantId: 'brand_01',
+      tenantToken: 'b3f75817a5f342c2bc34376020b9d04023a7c0df6df1437caec45252c7ea4d62',
+      endpoint: 'http://localhost:3001/events',
+    });
+    for (let i = 0; i < 10; i++) {
+      console.log('running event', i)
+      window.gammaengageSDK.API.reportEvent('page_view', {
+        page_url: 'https://www.google.com',
+        page_title: 'Google',
+        page_category: 'search',
+      });
+    }
+  }
+  init();
+
+  window.gammaengageSDK.API.setPageVisit('https://www.google.com', 'Google', 'search');
+  window.gammaengageSDK.API.reportEvent('deposit_initiated', {
+    amount: 100,
+    currency: 'USD',
+  });
+  window.gammaengageSDK.API.reportEvent('deposit_completed', {
+    amount: 100,
+    currency: 'USD',
+  });
+  window.gammaengageSDK.API.reportEvent('deposit_failed', {
+    amount: 100,
+    currency: 'USD',
+  });
+</script>
+</html>
