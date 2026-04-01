@@ -100,7 +100,13 @@ flowchart LR
   EX_GC --> CD["channel-delivery\nge.campaigns.outbound"]
 
   LE["lifecycle-engine\nCron / HTTP"] --> EX_GL
+
+  CH2[(ClickHouse + Postgres)]
+  AI["ai-engine\n(scoring, no raw queue)"]
+  CH2 <--> AI
 ```
+
+**ai-engine** is drawn with a **read/write loop** to ClickHouse and Postgres (see §6); it does not subscribe to `ge.events`.
 
 ---
 
@@ -146,18 +152,72 @@ Listens on **`ge.lifecycle`** / `ge.lifecycle.campaign-engine`. Maps **`campaign
 
 ---
 
-## 6. Supporting services (not queue consumers for raw events)
+## 6. ai-engine — scoring, batch jobs, and training
+
+**ai-engine** is a **Python (FastAPI)** service. It does **not** consume `ge.events.raw.v1`. Instead it turns **stored** casino activity into **risk and value scores** and **next-best-action (NBA)** recommendations by reading the same data planes the pipeline already maintains: primarily **ClickHouse** (event history / aggregates for features) and **PostgreSQL** (`player_profiles` for identity, consent flags, and **persisted scores**).
+
+### 6.1 Runtime scoring (`NbaEngine`)
+
+On each score request or batch job:
+
+1. **Feature extraction** — `extract_features` / `extract_features_batch` load player-centric features from ClickHouse (and related sources) in line with the training pipeline’s semantics.
+2. **Three models** — **churn**, **VIP**, and **RG (responsible gambling) risk** (`churn_model`, `vip_model`, `rg_risk_model`). Insufficient history can trigger **RFM-style fallbacks** for churn/VIP; RG still runs.
+3. **NBA policy** — `rank_actions` applies business rules (including RG thresholds) to produce ranked actions.
+
+Exposed HTTP routes (protected with **`X-API-Key`** where configured):
+
+| Route | Purpose |
+|-------|---------|
+| `POST /score/player` | Single-player score (latency-sensitive path) |
+| `GET /score/player/{brand_id}/{player_id}` | Same as above for simple lookups |
+| `POST /score/batch` | Up to many players; failures isolated per row |
+| `GET /health` | Liveness / readiness |
+| `POST /admin/reload-models` | Hot-reload `.joblib` models from disk (`X-Internal-Key`); does not block the event loop |
+
+Prometheus metrics are mounted at `/metrics`.
+
+### 6.2 Scheduled batch scoring (link to lifecycle and campaigns)
+
+An **APScheduler** job (`batch_scorer`, cron from settings, default **every few hours**) walks **`player_profiles`** in pages, scores players in bulk (with **batched ClickHouse** queries where possible), then **writes back** to Postgres:
+
+- `churn_score`, `vip_score`, `rg_risk_score`, `nba_action`, `scores_updated_at`
+
+Those fields are what **lifecycle-engine** (and operator dashboards) use when they read **player profile** rows together with ClickHouse activity — so casino events **indirectly** drive AI outputs: **ingestion → ClickHouse (+ profile updates) → batch scorer → profile scores → lifecycle evaluation**.
+
+RG alerts can be emitted via the **notifier** hook during batch runs (replace with real channels in production).
+
+### 6.3 Training (offline; not in the hot request path)
+
+Training is **offline** and does not use RabbitMQ:
+
+| Script | Role |
+|--------|------|
+| **`scripts/train_from_db.py`** | Pulls historical events from **ClickHouse**, uses **time-travel** feature windows and future labels so training matches **feature_extractor** semantics at score time. |
+| **`scripts/train_from_casino_data.py`** | Trains from **external real casino-shaped datasets** (e.g. Kaggle / Mendeley); preferred over older e-commerce proxy data — see `services/ai-engine/scripts/README.md`. |
+| **`scripts/train_from_kaggle.py`** | Legacy e-commerce proxy (documented as biased vs production iGaming). |
+
+Artifacts are **LightGBM** (and related) **`.joblib`** files under the configured **`MODEL_DIR`**. After deploy, **`POST /admin/reload-models`** can load new weights without restarting the process.
+
+### 6.4 How this fits the event diagram
+
+- **Casinos** still send data only through **event-ingestion** (and files via **data-connector**).
+- **ai-engine** **never** replaces that path; it **reads** the resulting warehouse state and **updates scores** for automation and reporting.
+- For a **mental model**: raw events → **campaign/identity/profile** via RabbitMQ; **parallel** **analytics + ML** via ClickHouse/Postgres and **ai-engine** batch/API.
+
+---
+
+## 7. Supporting services (not queue consumers for raw events)
 
 | Service | Role relative to events |
 |---------|-------------------------|
 | **game-catalog** | Referenced during ingestion **enrichment** (game metadata by `game_id`). |
 | **tenant-admin** | Brand/tenant admin; **integration health** aggregates ClickHouse + data-connector + API key usage (`GET /brands/:id/health`). |
 | **admin-auth** | Admin authentication (separate from casino ingest keys). |
-| **ai-engine** | Model training / scoring pipelines (e.g. offline scripts using casino-shaped data); not a RabbitMQ consumer of `ge.events.raw.v1` in the same path as the Nest services above. |
+| **ai-engine** | See **§6** — scoring and training; uses ClickHouse + Postgres, not `ge.events.raw.v1`. |
 
 ---
 
-## 7. Observability and health
+## 8. Observability and health
 
 - **ClickHouse** `events_raw` (and related tables) backs **last event time**, **24h counts**, and integration dashboards — see [integration-health-contract.md](./integration-health-contract.md).
 - **Synthetic tests** can post `integration_health_test` events through ingestion and poll for correlation IDs in ClickHouse.
@@ -165,7 +225,7 @@ Listens on **`ge.lifecycle`** / `ge.lifecycle.campaign-engine`. Maps **`campaign
 
 ---
 
-## 8. Related documents
+## 9. Related documents
 
 | Document | Content |
 |----------|---------|
@@ -173,10 +233,11 @@ Listens on **`ge.lifecycle`** / `ge.lifecycle.campaign-engine`. Maps **`campaign
 | [integration-health-contract.md](./integration-health-contract.md) | Health API contract and aggregation rules |
 | [integration-health-runbook.md](./integration-health-runbook.md) | Operator troubleshooting |
 | [README.md](../README.md) | Monorepo layout, env vars, quick start |
+| [services/ai-engine/scripts/README.md](../services/ai-engine/scripts/README.md) | Casino vs proxy datasets, `train_from_casino_data.py` options |
 
 ---
 
-## 9. Summary
+## 10. Summary
 
 1. **Casinos** send events via **SDK**, **HTTP API**, or **files** processed by **data-connector** — all normalized through **event-ingestion**.
 2. **event-ingestion** validates, deduplicates, enriches, writes **ClickHouse**, and publishes to **`ge.events`** (raw + profile updates).
@@ -184,5 +245,6 @@ Listens on **`ge.lifecycle`** / `ge.lifecycle.campaign-engine`. Maps **`campaign
 4. **channel-delivery** sends messages to players and records dispatch / webhooks.
 5. **identity-engine** and **player-profile** maintain **identity graph** and **player records** in parallel.
 6. **lifecycle-engine** evaluates stages on a schedule (and on-demand), publishing **lifecycle** events that **campaign-engine** turns into tagged campaigns.
+7. **ai-engine** scores players from **ClickHouse + Postgres** (API and scheduled batch), persists **churn / VIP / RG / NBA** fields on **`player_profiles`**, and retrains models offline from **ClickHouse** or external casino datasets — **without** consuming the raw-events queue.
 
 For exact queue names, routing keys, and class names, search the repo for the constants quoted above (e.g. `ge.events.raw.v1`, `CampaignOutboundMessage`).
