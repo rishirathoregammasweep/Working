@@ -225,19 +225,7 @@ Artifacts are **LightGBM** (and related) **`.joblib`** files under the configure
 
 ---
 
-## 9. Related documents
-
-| Document | Content |
-|----------|---------|
-| [casino-integration-guide.md](./casino-integration-guide.md) | Non-technical integration steps, event type cheat sheet, channels |
-| [integration-health-contract.md](./integration-health-contract.md) | Health API contract and aggregation rules |
-| [integration-health-runbook.md](./integration-health-runbook.md) | Operator troubleshooting |
-| [README.md](../README.md) | Monorepo layout, env vars, quick start |
-| [services/ai-engine/scripts/README.md](../services/ai-engine/scripts/README.md) | Casino vs proxy datasets, `train_from_casino_data.py` options |
-
----
-
-## 10. Summary
+## 9. Summary
 
 1. **Casinos** send events via **SDK**, **HTTP API**, or **files** processed by **data-connector** — all normalized through **event-ingestion**.
 2. **event-ingestion** validates, deduplicates, enriches, writes **ClickHouse**, and publishes to **`ge.events`** (raw + profile updates).
