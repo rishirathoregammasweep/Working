@@ -1,6 +1,6 @@
 # Event flow, casino integration, and service responsibilities
 
-This document explains how **third-party casinos** send data into GammaEngage, how **events move through the platform**, which **queues and exchanges** are involved, and **what each backend service does** when events are consumed. It complements the operator-facing [casino-integration-guide.md](./casino-integration-guide.md) with an engineering view grounded in this repository.
+This document explains how **third-party casinos** send data into GammaEngage, how **events move through the platform**, which **queues and exchanges** are involved, and **what each backend service does** when events are consumed. It complements the operator-facing with an engineering view grounded in this repository.
 
 ---
 
@@ -219,7 +219,7 @@ Artifacts are **LightGBM** (and related) **`.joblib`** files under the configure
 
 ## 8. Observability and health
 
-- **ClickHouse** `events_raw` (and related tables) backs **last event time**, **24h counts**, and integration dashboards — see [integration-health-contract.md](./integration-health-contract.md).
+- **ClickHouse** `events_raw` (and related tables) backs **last event time**, **24h counts**, and integration dashboards
 - **Synthetic tests** can post `integration_health_test` events through ingestion and poll for correlation IDs in ClickHouse.
 - **DLQ / retries** apply per consumer queue; **tenant-admin** can surface DLQ-oriented alerts depending on configuration.
 
