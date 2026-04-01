@@ -47,7 +47,7 @@ The SDK is designed for a **drop-in** experience: one script tag (or a single `i
     window.gammaengageSDK.init({
       tenantId: 'YOUR_TENANT_ID',
       tenantToken: 'YOUR_TENANT_TOKEN',
-      endpoint: 'https://your-ingestion-host/events',
+      endpoint: 'http://localhost:3001/events',
       debug: false,
     });
 
@@ -75,7 +75,7 @@ The SDK is designed for a **drop-in** experience: one script tag (or a single `i
 <script src="our_deployed_url"
         data-tenant-id="YOUR_TENANT_ID"
         data-tenant-token="YOUR_TENANT_TOKEN"
-        data-endpoint="https://your-ingestion-host/events"
+        data-endpoint="http://localhost:3001/events"
         data-debug="false"></script>
 ```
 
@@ -89,7 +89,7 @@ The SDK auto-initializes on `DOMContentLoaded`.
   window.gammaengageSDK.init({
     tenantId: 'YOUR_TENANT_ID',
     tenantToken: 'YOUR_TENANT_TOKEN',
-    endpoint: 'https://your-ingestion-host/events',
+    endpoint: 'http://localhost:3001/events',
     // autoPageVisit: true,  // default: fire set_page_visit shortly after init
     // debug: true,
   });
