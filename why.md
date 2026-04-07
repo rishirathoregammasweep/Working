@@ -15,7 +15,6 @@ Picture **one casino (tenant)** with about **50,000 players** and **20–30 live
 - **Spikes:** A scheduled send or a sudden burst of player activity can create **a lot of work in a short time**. If that work runs in the **same process** as “receive events from every customer,” one busy tenant can **slow down or starve** everyone else.
 - **Queues help:** Work waits in a line (e.g. `ge.campaigns.outbound`) instead of piling into one program’s memory. If you merge everything, you **lose that cushion**—problems show up as **one big crash** instead of **a growing queue** you can watch and scale.
 
-**In one sentence:** Merging does not make the math smaller; it only **hides** it until the whole app struggles at once.
 
 ---
 
