@@ -1,54 +1,62 @@
-# Player traffic vs campaigns — bullets (with one-line examples)
 
-## How the split helps
+**Audience:** engineering and product leadership deciding whether to collapse GammaEngage-style services into a single deployable.
 
-- **Ingestion stays fast while campaigns do heavy work** — e.g. `POST /events` does not run every trigger synchronously; `campaign-engine` consumes `ge.events.raw.v1` async.
-- **Change delivery without touching the public ingest API** — e.g. add a webhook path in `channel-delivery` without redeploying `event-ingestion`.
-- **Clear queue contracts between “facts” and “sends”** — e.g. raw events → `ge.events.raw.v1`, outbound work → `ge.campaigns.outbound`.
-- **Module isolation in-repo** — e.g. no service queries another service’s DB; use RabbitMQ and read-only HTTP where documented in root `README.md`.
+**Context in this repo:** Ingestion, campaign logic, channel delivery, player profile, and **AI scoring** are separate processes connected by **queues** (e.g. RabbitMQ) and HTTP. **`ai-engine` is Python (FastAPI-style)**; most customer-facing and admin APIs are **NestJS (TypeScript)**.
 
-## Player traffic (separate path)
+---
 
-- **`event-ingestion` — accept, dedupe, store, publish** — e.g. Redis `idem:*` then insert `events_raw` and publish to `ge.events.raw.v1` (port 3001 typical).
-- **Per-brand rate limits on public routes** — e.g. 429 + `Retry-After` when a brand exceeds the Redis counter window.
-- **SSE from browsers / SDK** — e.g. `GET /sse/campaigns?brand_id=&player_id=` holds long-lived connections for popups.
-- **`player-profile` — durable profile + GDPR** — e.g. `DELETE .../gdpr` with `X-API-Key` anonymises across Postgres/ClickHouse/graph.
-- **`game-catalog` — enrich events with game metadata** — e.g. HTTP lookup during ingest before write.
-- **`identity-engine` — link identities from events** — e.g. consumer on `ge.events` builds the identity graph.
-- **`analytics` / `ai-engine` — read-heavy scoring & reports** — e.g. `POST /player` scoring with a sub-200ms style target in `ai-engine`.
+## 1. The load is multiplicative, not additive
 
-## Campaign handling (separate path)
+For one tenant, assume **~50,000 active users** in scope and **20–30 live campaigns** (triggers, segments, schedules, channel sends). Work is not “one campaign” at a time in the abstract—it is **per user × per campaign × per event (or per tick)** in the worst case.
 
-- **`campaign-engine` — consume raw events, evaluate rules, publish sends** — e.g. update Redis `player_state:...` then push matches to `ge.campaigns`.
-- **Campaign definitions & scheduler** — e.g. REST on port 3003; cron/scheduled sends go to `ge.campaigns.outbound`.
-- **`channel-delivery` — actually send (email/SMS/push/webhook/SSE)** — e.g. consumer on `ge.campaigns.outbound` with throttles and quiet hours envs.
-- **Admin paths stay off the hot ingest path** — e.g. suppressions via `tenant-admin` proxy to `channel-delivery` for audit + audit log.
+- **Illustration (order of magnitude, not a promise of exact product math):** If something must consider **each user against each campaign** on a schedule or event burst, you are in **O(users × campaigns)** territory for that phase. With 50k users and 25 campaigns, that is **1.25M candidate evaluations** for a single full sweep—not counting retries, channel fan-out, or ML calls.
+- **Bursts:** One tenant’s **scheduled send** or **big behavioural spike** can enqueue a large slice of that space in minutes. If that shares **one process** with **global event ingestion**, you risk **CPU and GC contention**, **thread pool starvation**, and **tail latency** on unrelated brands.
+- **Queues exist to absorb bursts:** A merged service removes the natural **backpressure boundary** (consumer lag on `ge.campaigns.outbound`, DLQ, scale-out of workers only). Everything becomes one heap and one release.
 
-## Flow (one glance)
+**Takeaway for planning:** Merging does not remove the multiplication—it **hides** it until the whole system falls over together.
 
-- **Casino → ingest → facts** — e.g. wallet → `event-ingestion` → ClickHouse + `ge.events.raw.v1`.
-- **Facts → decisions → queue** — e.g. `campaign-engine` → triggers → `ge.campaigns` / outbound.
-- **Queue → channels** — e.g. `channel-delivery` → Sendgrid/Twilio/SSE bus as configured.
-- **Parallel consumers** — e.g. `player-profile` and `identity-engine` also read the event stream without blocking ingest.
+---
 
-## Planning: where to look
+## 2. Why 20–30 campaigns can “bombard” a unified stack
 
-- **Spikes, API keys, idempotency** — e.g. scale `event-ingestion` + Redis for limits and `idem:*`.
-- **Triggers, journeys, schedules** — e.g. tune `campaign-engine` replicas and Postgres/Redis for that service.
-- **Provider slowness, caps, compliance sends** — e.g. `channel-delivery` + `DAILY_SEND_CAP`, retries, DLQ patterns in `infra/deploy.py`.
-- **PII / erasure** — e.g. `player-profile` GDPR endpoints and `gdpr_erasure_log`.
+If campaign evaluation, delivery, ingestion, and optional **per-player ML** all run in **one binary**:
 
-## Why not one mega-service
+- **No isolation:** A runaway segment refresh or a bad template loop ties up the same event loop / thread pool that serves **`POST /events`** and health checks.
+- **Cascading timeouts:** Slow **SMS/email providers** or **webhooks** block workers that you might have reused for “everything” in a monolith.
+- **Memory pressure:** Holding large in-memory structures for “all campaigns for all users” in one process is riskier than **sharding workers** by queue or by service.
+- **One deploy rolls the dice for everyone:** A campaign feature regression can take down **ingestion** for **all tenants**—unacceptable for a multi-tenant CRM.
 
-- **Different scale knobs** — e.g. ingest needs many stateless replicas; delivery may need fewer instances but longer timeouts.
-- **Smaller blast radius** — e.g. a bug in Twilio integration should not kill `POST /events`.
-- **Independent release trains** — e.g. ship campaign templates weekly without freezing event schema changes.
-- **Mixed runtimes** — e.g. Nest `channel-delivery` vs Python `ai-engine` vs ClickHouse writers in one image is heavy operationally.
-- **Network boundaries** — e.g. keep internal profile APIs off the same public ingress as raw event POST unless you add a gateway anyway.
-- **Easier incidents** — e.g. “Rabbit backlog on `ge.campaigns.outbound`” vs “ClickHouse insert errors” show up in different health checks.
+Separate services let you **scale campaign-engine and channel-delivery** independently from **event-ingestion**, and throttle at **RabbitMQ + worker count** instead of at “hope the monolith survives.”
 
-## Related docs
+---
 
-- [database-migrations.md](./database-migrations.md)
-- [../README.md](../README.md) (rate limits, isolation)
-- [../services/event-ingestion/README.md](../services/event-ingestion/README.md)
+## 3. Python AI engine vs NestJS: keep them separate on purpose
+
+| Factor | Implication |
+|--------|-------------|
+| **Runtime** | **Python** (`ai-engine`: scoring, feature extraction from ClickHouse/Postgres) vs **Node/NestJS** (ingestion, campaigns, delivery). Different **GC**, **concurrency model**, and **dependency trees**. |
+| **CPU / latency** | ML and batch scoring are often **CPU-bound** or **I/O-heavy to analytics stores**; mixing them into NestJS either **blocks the Node event loop** or forces awkward **worker thread / subprocess** bridges—you already have a dedicated Python service. |
+| **Shipping** | **Separate container** = smaller Nest images, **independent** Python version and **numpy/scipy** stack without bloating every API pod. |
+| **Scaling** | Scale **`ai-engine`** replicas for scoring load without scaling **every** Nest service. |
+
+Merging “everything” would mean either **dropping** the dedicated Python stack (reimplementing ML in TS—high cost) or **embedding** Python in Node (operational complexity, not simplification).
+
+---
+
+## 4. What we recommend instead of a monolith
+
+- **Keep message boundaries** between facts (`ge.events.raw.v1`) and actions (`ge.campaigns`, `ge.campaigns.outbound`) so bursts **queue** instead of **blocking** ingest.
+- **Cap and schedule** heavy tenant work (per-brand limits, staggered segment runs, DLQ alerts)—easier when **delivery** and **evaluation** are observable separate services.
+- **Scale horizontally** the tier that is hot (e.g. more `channel-delivery` consumers vs more `event-ingestion` replicas) using metrics that are already **per service**.
+- **Treat `ai-engine` as an optional, scaled sidecar** to Nest services via HTTP + API key—not inline in the request path of raw ingestion unless you explicitly design async scoring.
+
+---
+
+## 5. Related reading
+
+- [player-traffic-vs-campaign-architecture.md](./player-traffic-vs-campaign-architecture.md) — short bullet map of services and queues.
+- Root [README.md](../README.md) — rate limiting, module isolation.
+
+---
+
+*Figures (50k users, 20–30 campaigns) are planning examples; tune with production metrics (queue depth, p95 latency, cost per evaluation).*
