@@ -1,251 +1,159 @@
-# Trigger flow when events arrive from the app
+# Hierarchical flow: Event → Trigger → Campaign → Channel delivery
 
-This document explains how a player or app event becomes outbound messaging across **multiple channels** (email, SMS, push, web push, WhatsApp, in-app/SSE, etc.) in this platform.
+This page shows the pipeline as a **top-down tree** centered on four stages: **Event** → **Trigger** → **Campaign** → **Channel delivery**. Supporting detail hangs under each stage. For full prose and write matrices, see [trigger-explanation.md](./trigger-explanation.md).
 
-## End-to-end flow (high level)
+**How to read:** Follow the **spine** (large rounded nodes **1 → 2 → 3 → 4**). Each stage lists what runs there. A second diagram lists **queues and data stores** next to the same four stages.
 
-1. **Ingest** — The casino app (or server) sends a validated **event envelope** to **event-ingestion** (HTTP). Idempotency is checked; optional enrichment runs; the event is written to analytics storage and published to the raw events queue.
-2. **Campaign engine** — **campaign-engine** consumes from the raw events queue, updates **player state**, snapshots, conversion checks, and optional **journey** enrollment, then **evaluates triggers**.
-3. **Triggers** — For each active trigger whose `event_type` matches and whose **conditions** pass (against player state, event payload, and optional scores), the engine builds a **matched trigger**. Single-event triggers fire immediately; **sequential** triggers advance Redis-backed sequence state until the full sequence completes.
-4. **Campaign publish** — Each match is turned into an outbound message: campaign templates are loaded, **A/B test** and **control group** logic apply, and the message is published to RabbitMQ (`ge.campaigns` exchange, routing key `campaigns.outbound.v1`).
-5. **Channel delivery** — **channel-delivery** consumes `ge.campaigns.outbound`, resolves the player’s contact info, applies suppression and policy, renders templates, then sends on one or more **channels** according to the campaign’s delivery mode.
+---
 
-## Diagram
+## Spine diagram — the four stages
 
 ```mermaid
-flowchart LR
-  subgraph App["Casino app / backend"]
-    E[Player action → event]
-  end
+graph TD
+  ROOT((Player / app event))
 
-  subgraph Ingest["event-ingestion"]
-    API[HTTP ingest]
-    ID[Idempotency + optional enrichment]
-    Q1[(ge.events.raw.v1)]
-  end
+  ROOT --> EV([1 · Event])
+  EV --> TR([2 · Trigger])
+  TR --> CA([3 · Campaign])
+  CA --> DL([4 · Channel delivery])
 
-  subgraph CE["campaign-engine"]
-    EC[Event consumer]
-    PS[Player state + snapshot]
-    CV[Conversion tracker]
-    JY[Journey enrollment]
-    TE[Trigger evaluator]
-    CP[Campaign publisher]
-  end
+  %% --- Event (ingestion) ---
+  EV --> e1[HTTP event-ingestion — validate envelope]
+  EV --> e2[Redis — idempotency key]
+  EV --> e3[ClickHouse — events_raw + optional player_state row]
+  EV --> e4[RabbitMQ — publish to ge.events.raw.v1]
 
-  subgraph MQ2["RabbitMQ"]
-    EX[ge.campaigns exchange]
-    Q2[(ge.campaigns.outbound)]
-  end
+  %% --- Trigger (campaign-engine: from event to matched triggers) ---
+  TR --> t1[EventConsumer — read from ge.events.raw.v1]
+  TR --> t2[Redis — player_state updated from event]
+  TR --> t3[Postgres — campaign_player_snapshots upsert]
+  TR --> t4[Conversions + journeys — optional PG writes / reads]
+  TR --> t5[Postgres — load active triggers by event_type]
+  TR --> t6[TriggerEvaluator — conditions on state + event]
+  TR --> t7[Redis — seq:* keys for sequential triggers]
 
-  subgraph CD["channel-delivery"]
-    CC[Campaign consumer]
-    R[Render + policy + suppression]
-    CH{Delivery mode}
-    WF[Waterfall: try channels in order]
-    CCr[Concurrent: all channels in parallel]
-    OUT[Per-channel send]
-  end
+  %% --- Campaign (publisher: matched trigger → outbound message) ---
+  CA --> c1[CampaignPublisher — one message per matched trigger]
+  CA --> c2[Postgres — read campaign, A/B assignment, control group]
+  CA --> c3[Postgres — campaign_delivery_logs when not control]
+  CA --> c4[Build payload — templates, channels, waterfall flag]
+  CA --> c5[RabbitMQ — ge.campaigns exchange · campaigns.outbound.v1]
 
-  E --> API --> ID --> Q1
-  Q1 --> EC --> PS --> CV --> JY --> TE --> CP
-  CP --> EX --> Q2 --> CC --> R --> CH
-  CH --> WF --> OUT
-  CH --> CCr --> OUT
+  %% --- Channel delivery ---
+  DL --> d1[CampaignConsumer — ge.campaigns.outbound]
+  DL --> d2[Player profile, suppression, contact policy]
+  DL --> d3[Redis — send throttle · daily caps]
+  DL --> d4[Render — per channel · email tracking tokens in Postgres]
+  DL --> d5[Dispatch — waterfall or concurrent multi-channel]
+  DL --> d6[Send — email, SMS, push, web push, WhatsApp, popup / SSE]
+  DL --> d7[ClickHouse — campaign.dispatched, opens / clicks · webhooks]
+
+  classDef rootStyle fill:#b8d4e8,stroke:#2c5282,stroke-width:2px,color:#1a202c
+  classDef stage1 fill:#bbdefb,stroke:#1565c0,stroke-width:2px,color:#0d47a1
+  classDef stage2 fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
+  classDef stage3 fill:#ffe0b2,stroke:#e65100,stroke-width:2px,color:#bf360c
+  classDef stage4 fill:#e1bee7,stroke:#6a1b9a,stroke-width:2px,color:#4a148c
+  classDef leaf fill:#fafafa,stroke:#616161,stroke-width:1px,color:#212121
+
+  class ROOT rootStyle
+  class EV,e1,e2,e3,e4 stage1
+  class TR,t1,t2,t3,t4,t5,t6,t7 stage2
+  class CA,c1,c2,c3,c4,c5 stage3
+  class DL,d1,d2,d3,d4,d5,d6,d7 stage4
 ```
 
-### Sequence diagram (happy path: one event → one campaign send)
+### Spine in one sentence per stage
 
-```plantuml
-@startuml trigger-flow-sequence
-autonumber
-actor "Casino app" as App
-participant "event-ingestion" as EI
-participant "Redis\n(idempotency)" as R0
-participant "ClickHouse" as CH
-participant "ge.events.raw.v1" as Q1
-participant "campaign-engine\nEventConsumer" as CE
-participant "Redis\n(player_state)" as R1
-participant "PostgreSQL" as PG
-participant "TriggerEvaluator\n+ Publisher" as TE
-participant "ge.campaigns.outbound" as Q2
-participant "channel-delivery" as CD
+| # | Stage | Role |
+|---|--------|------|
+| **1** | **Event** | Accept the envelope, dedupe, persist analytics, enqueue for the engine. |
+| **2** | **Trigger** | Refresh state, evaluate rules in DB + Redis, produce **matched triggers**. |
+| **3** | **Campaign** | Turn each match into an **outbound campaign message** (templates, experiment, logs) and publish to the campaign queue. |
+| **4** | **Channel delivery** | Consume that message, apply policy, and **send** on one or more channels. |
 
-App -> EI: ingest EventEnvelope
-activate EI
-EI -> R0: checkAndSetIdempotency
-EI -> CH: insert events_raw
-EI -> Q1: publish
-deactivate EI
+---
 
-Q1 -> CE: deliver message
-activate CE
-CE -> R1: SET player_state
-CE -> PG: upsert player_snapshots
-CE -> PG: checkConversion (read logs;\nmaybe INSERT conversion)
-CE -> PG: journey enroll (optional)
-CE -> TE: evaluate + publish
-activate TE
-TE -> PG: SELECT triggers
-TE -> R1: sequence state (if needed)
-TE -> PG: SELECT campaign, A/B;\nINSERT campaign_delivery_logs
-TE -> Q2: publish CampaignOutboundMessage
-deactivate TE
-deactivate CE
-
-Q2 -> CD: deliver message
-activate CD
-CD -> PG: load contact, suppression
-CD -> CD: render, dispatch channels
-CD -> CH: forward campaign.dispatched
-deactivate CD
-
-@enduml
-```
-
-### Sequence diagram (Mermaid — for Markdown preview)
+## Same four stages — messaging & storage only
 
 ```mermaid
-sequenceDiagram
-  autonumber
-  actor App as Casino app
-  participant EI as event-ingestion
-  participant R0 as Redis (idempotency)
-  participant CH as ClickHouse
-  participant Q1 as ge.events.raw.v1
-  participant CE as campaign-engine
-  participant R1 as Redis (player_state)
-  participant PG as PostgreSQL
-  participant TE as Triggers + publisher
-  participant Q2 as ge.campaigns.outbound
-  participant CD as channel-delivery
+graph TD
+  ROOT((Four stages))
 
-  App->>EI: POST EventEnvelope
-  EI->>R0: idempotency SET
-  EI->>CH: insert events_raw
-  EI->>Q1: publish
+  ROOT --> EV([1 · Event])
+  EV --> TR([2 · Trigger])
+  TR --> CA([3 · Campaign])
+  CA --> DL([4 · Channel delivery])
 
-  Q1->>CE: consume
-  CE->>R1: SET player_state
-  CE->>PG: snapshot upsert
-  CE->>PG: conversions / journeys (optional)
-  CE->>TE: evaluate + publish
-  TE->>PG: read triggers, campaigns
-  TE->>R1: seq state (sequential triggers)
-  TE->>PG: insert delivery_log (non-control)
-  TE->>Q2: publish outbound
+  EV --> ev_q[Queue in: HTTP]
+  EV --> ev_x[Queue out: ge.events.raw.v1]
+  EV --> ev_s[Redis + ClickHouse — idempotency, events_raw, optional player_state]
 
-  Q2->>CD: consume
-  CD->>PG: contact, suppression, tracking
-  CD->>CH: campaign.dispatched (async)
-  CD-->>App: channel sends (email, SMS, …)
+  TR --> tr_q[Queue in: ge.events.raw.v1]
+  TR --> tr_s[Redis + Postgres — state, snapshots, triggers read, seq:*]
+
+  CA --> ca_q[Queue out: ge.campaigns → ge.campaigns.outbound]
+  CA --> ca_s[Postgres — campaigns, delivery_logs]
+
+  DL --> dl_q[Queue in: ge.campaigns.outbound]
+  DL --> dl_s[Postgres · Redis · ClickHouse — contact, tracking, throttle, analytics]
+
+  classDef rootStyle fill:#b8d4e8,stroke:#2c5282,stroke-width:2px,color:#1a202c
+  classDef s1 fill:#bbdefb,stroke:#1565c0,stroke-width:1px,color:#0d47a1
+  classDef s2 fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#1b5e20
+  classDef s3 fill:#ffe0b2,stroke:#e65100,stroke-width:1px,color:#bf360c
+  classDef s4 fill:#e1bee7,stroke:#6a1b9a,stroke-width:1px,color:#4a148c
+
+  class ROOT rootStyle
+  class EV,ev_q,ev_x,ev_s s1
+  class TR,tr_q,tr_s s2
+  class CA,ca_q,ca_s s3
+  class DL,dl_q,dl_s s4
 ```
 
-## When Postgres, Redis, and ClickHouse write
+---
 
-Writes are listed in roughly the order they happen along the path. Some steps are **reads only** (for example loading active triggers); those are noted briefly so it is clear where the database is touched.
-
-### 1. Event ingestion (`event-ingestion`)
-
-| Store | What happens |
-|--------|----------------|
-| **Redis** | **Idempotency:** `checkAndSetIdempotency` records the `(brand_id, idempotency_key)` so duplicate HTTP submits are rejected before side effects. |
-| **ClickHouse** | **`events_raw`:** each accepted envelope is inserted for analytics and raw replay. |
-| **ClickHouse** | **`player_state` (optional):** after the raw insert, a fire-and-forget path may insert a row for **deposit / bet / session / registration**-style events (aggregated counters in ClickHouse; separate from Redis player state in campaign-engine). |
-| **RabbitMQ** | Publish to the raw events queue and profile-update stream (not DB/Redis/CH, but part of the same ingest step). |
-
-### 2. Campaign engine (`campaign-engine`, one message from `ge.events.raw.v1`)
-
-| Store | What happens |
-|--------|----------------|
-| **Redis** | **`player_state:{brand_id}:{player_id}`:** merged state is **SET** with TTL after each event (`PlayerStateService.updateFromEvent`). This is what trigger conditions use. |
-| **Postgres** | **`player_snapshots`:** **insert** on first seen player, else **update** in place (`SnapshotService.upsertFromState`) — async/non-blocking relative to ack in practice but still part of processing. |
-| **Postgres** | **Conversion tracking:** **reads** `campaign_delivery_logs` and `campaigns`; if the event matches a campaign’s conversion type inside the attribution window, **`campaign_conversions`** gets an **insert** (`INSERT … ON CONFLICT DO NOTHING`). |
-| **Postgres** | **Journeys (optional):** if a journey matches the event and entry rules, **`journey_enrollments`** may be **inserted** or prior rows **deleted/updated** (`JourneyService.enrollFromEvent`). |
-| **Postgres** | **Triggers:** **read** active rows from **`triggers`** for `brand_id` + `event_type` (no write on evaluate). |
-| **Redis** | **Sequential triggers:** keys `seq:{brand_id}:{player_id}:{sequence_id}` are **SET** / **DEL** as steps complete (`TriggerEvaluatorService`). |
-| **Postgres** | **Campaign publish:** **read** `campaigns` (and A/B logic). When the player is **not** in the control group, **`campaign_delivery_logs`** gets a **save** (`ConversionTrackerService.logDelivery`) so later conversions can be attributed. |
-| **Postgres** | **Conversions:** no extra write at publish beyond the delivery log above; conversion rows appear on **later** events when `checkConversion` matches. |
-
-### 3. Channel delivery (`channel-delivery`, outbound message)
-
-| Store | What happens |
-|--------|----------------|
-| **Postgres** | **Email tracking:** when email HTML is instrumented, **open/click tokens** are **inserted** into the tracking table (`TrackingService.createOpenToken` / `createClickToken`). |
-| **Redis** | **Send throttle:** if daily caps apply, counters may be **INCR** / **EXPIRE** (and **DECR** on failure paths) per player/channel (`SendThrottleService`). |
-| **ClickHouse** | **`events_raw_buffer`:** after dispatch, a **`campaign.dispatched`** row is forwarded for analytics (`CampaignEventForwarderService` → non-blocking). |
-| **Postgres** | **Email opens/clicks:** when a tracking URL is hit, **`fired_at`** is **updated** on the token row; then **ClickHouse** receives **`email.opened`** / **`email.clicked`** via the same forwarder pattern. |
-
-### Summary diagram (storage touchpoints)
+## Compact tree — storage by stage
 
 ```mermaid
-flowchart TB
-  subgraph ingest["event-ingestion"]
-    R1[(Redis idempotency)]
-    CH1[(CH events_raw)]
-    CH1b[(CH player_state optional)]
-  end
+graph TD
+  ROOT((Storage along the pipeline))
 
-  subgraph ce["campaign-engine"]
-    R2[(Redis player_state)]
-    PG1[(PG player_snapshots)]
-    PG2[(PG conversions + delivery logs + journeys)]
-    R3[(Redis seq: triggers)]
-    PG3[(PG triggers read, campaigns read)]
-  end
+  ROOT --> ING([1 · Event / ingest])
+  ROOT --> ENG([2–3 · Trigger + campaign engine])
+  ROOT --> DEL([4 · Channel delivery])
 
-  subgraph cd["channel-delivery"]
-    PG4[(PG email tracking)]
-    R4[(Redis throttle)]
-    CH2[(CH campaign.dispatched + opens/clicks)]
-  end
+  ING --> ING_R[Redis — idempotency]
+  ING --> ING_C[ClickHouse — events_raw, optional player_state]
 
-  ingest --> ce --> cd
+  ENG --> ENG_R[Redis — player_state, seq:*]
+  ENG --> ENG_P[Postgres — snapshots, triggers, campaigns, delivery_logs, conversions, journeys]
+
+  DEL --> DEL_P[Postgres — contact, suppression, email tracking]
+  DEL --> DEL_R[Redis — throttle]
+  DEL --> DEL_C[ClickHouse — campaign.dispatched, email.opened / clicked]
+
+  classDef rootStyle fill:#b8d4e8,stroke:#2c5282,stroke-width:2px,color:#1a202c
+  classDef stage fill:#e3f2fd,stroke:#1565c0,stroke-width:1px,color:#0d47a1
+  classDef leaf fill:#fafafa,stroke:#616161,stroke-width:1px,color:#212121
+
+  class ROOT rootStyle
+  class ING,ENG,DEL stage
+  class ING_R,ING_C,ENG_R,ENG_P,DEL_P,DEL_R,DEL_C leaf
 ```
 
-## Multiple channels
+---
 
-### Where channels are defined
+## Legend (spine diagram)
 
-- **Triggers** store a comma-separated channel list (for example `email,sms,push`), which becomes the `channels` array on the outbound message.
-- **Campaigns** can set **`waterfall`**: when true, channel-delivery tries channels **in list order** and **stops after the first successful** handoff; when false, it attempts **all listed channels concurrently** (`Promise.allSettled`).
+| Color | Stage | Covers |
+|-------|--------|--------|
+| Blue | **1 · Event** | Ingest service, dedupe, raw analytics, raw queue. |
+| Green | **2 · Trigger** | Consumer, state, DB triggers, evaluation, sequences. |
+| Orange | **3 · Campaign** | Publisher, campaign row, logs, RabbitMQ outbound message. |
+| Purple | **4 · Channel delivery** | Consumer, policy, multi-channel send, analytics side effects. |
 
-So “multiple channels” can mean:
-
-| Mode | Behaviour |
-|------|-----------|
-| **Concurrent** (default) | Email, SMS, push, etc. are all attempted for the same campaign send (subject to suppression, caps, and missing contact details per channel). |
-| **Waterfall** | Same ordered list, but only until one channel succeeds — useful when you want a single best-effort path (for example SMS first, then email). |
-
-### Supported delivery paths (conceptual)
-
-Channel-delivery routes each channel name to the appropriate integration (email provider, SMS, mobile push, web push registry, WhatsApp, SSE/popup for in-app, etc.). Each path can independently fail, be suppressed, or be retried according to service rules.
-
-### After send
-
-- A **`campaign.dispatched`** style event can be forwarded to analytics (for example ClickHouse).
-- **Webhooks** can be notified for downstream systems.
-
-## Key queues and exchange (reference)
-
-| Name | Role |
-|------|------|
-| `ge.events.raw.v1` | Raw validated events for campaign-engine consumption |
-| `ge.campaigns` (topic) + `campaigns.outbound.v1` | Routed messages to `ge.campaigns.outbound` for channel-delivery |
-
-## Related code (for maintainers)
-
-- Ingest and publish to raw queue: `services/event-ingestion/src/events/events.service.ts`, `rabbitmq.service.ts`
-- ClickHouse on ingest: `services/event-ingestion/src/events/clickhouse.service.ts` (`events_raw`, optional `player_state`)
-- Redis idempotency: `services/event-ingestion/src/events/redis.service.ts` (used from `events.service.ts`)
-- Consume events, evaluate triggers, publish campaigns: `services/campaign-engine/src/campaign/event-consumer.service.ts`, `trigger-evaluator.service.ts`, `campaign-publisher.service.ts`
-- Redis player state: `services/campaign-engine/src/player-state/player-state.service.ts`; sequential triggers: `trigger-evaluator.service.ts`
-- Postgres snapshots and conversions: `services/campaign-engine/src/snapshot/snapshot.service.ts`, `conversions/conversion-tracker.service.ts`
-- Multi-channel dispatch: `services/channel-delivery/src/consumer/campaign-consumer.service.ts` (`dispatchWaterfall`, `dispatchConcurrent`, `sendChannel`)
-- ClickHouse forward from delivery: `services/channel-delivery/src/analytics/campaign-event-forwarder.service.ts`, `tracking/tracking.service.ts`
-
-
+---
 
 ## See also
 
-- Narrative flow, multi-channel modes, and detailed write list: [trigger-explanation.md](./trigger-explanation.md)
+- [trigger-explanation.md](./trigger-explanation.md) — narrative flow, multi-channel modes, detailed DB/Redis/ClickHouse write list
