@@ -6,6 +6,54 @@ It complements [scheduled-campaign-flow.md](./scheduled-campaign-flow.md), which
 
 ---
 
+## Simple full hierarchy (event → app → campaign → email / message)
+
+One diagram, **top to bottom**: source → queue → engine → decision → bus → delivery → channels.
+
+```mermaid
+flowchart TB
+  subgraph L1["① Source"]
+    EXT["Upstream (game, CRM, SDK, …)"]
+    QRAW["RabbitMQ: ge.events.raw.v1"]
+    EXT --> QRAW
+  end
+
+  subgraph L2["② campaign-engine"]
+    EC["EventConsumer"]
+    PS["Player state · snapshot · conversions · journeys"]
+    TE["Trigger evaluation — triggers + campaign data from DB"]
+    EC --> PS --> TE
+  end
+
+  subgraph L3["③ Campaign run"]
+    MATCH{"Any trigger matches?"}
+    STOP["Stop — no outbound message"]
+    PUB["CampaignPublisher — job to RabbitMQ"]
+    MATCH -->|no| STOP
+    MATCH -->|yes| PUB
+  end
+
+  subgraph L4["④ Between services"]
+    BUS["ge.campaigns → routing campaigns.outbound.v1 → queue ge.campaigns.outbound"]
+    PUB --> BUS
+  end
+
+  subgraph L5["⑤ channel-delivery"]
+    CC["CampaignConsumer"]
+    GATE["Throttle · suppression · caps · load contact"]
+    RND["Render per channel"]
+    OUT["Email · SMS · Push · Web push · Popup · WhatsApp · …"]
+    BUS --> CC --> GATE --> RND --> OUT
+  end
+
+  QRAW --> EC
+  TE --> MATCH
+```
+
+**Summary:** Event → **`ge.events.raw.v1`** → **campaign-engine** (evaluate **triggers** / **campaigns**) → if matched, publish to **`ge.campaigns.outbound`** → **channel-delivery** sends the **email or message** (and other channels).
+
+---
+
 ## 1. High-level architecture
 
 ```mermaid
