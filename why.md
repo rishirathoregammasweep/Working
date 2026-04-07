@@ -1,62 +1,62 @@
+# Why we should not merge all backend services into one (tech lead brief)
 
-**Audience:** engineering and product leadership deciding whether to collapse GammaEngage-style services into a single deployable.
+**Who this is for:** Anyone deciding whether to ship one big “all-in-one” backend instead of separate services.
 
-**Context in this repo:** Ingestion, campaign logic, channel delivery, player profile, and **AI scoring** are separate processes connected by **queues** (e.g. RabbitMQ) and HTTP. **`ai-engine` is Python (FastAPI-style)**; most customer-facing and admin APIs are **NestJS (TypeScript)**.
-
----
-
-## 1. The load is multiplicative, not additive
-
-For one tenant, assume **~50,000 active users** in scope and **20–30 live campaigns** (triggers, segments, schedules, channel sends). Work is not “one campaign” at a time in the abstract—it is **per user × per campaign × per event (or per tick)** in the worst case.
-
-- **Illustration (order of magnitude, not a promise of exact product math):** If something must consider **each user against each campaign** on a schedule or event burst, you are in **O(users × campaigns)** territory for that phase. With 50k users and 25 campaigns, that is **1.25M candidate evaluations** for a single full sweep—not counting retries, channel fan-out, or ML calls.
-- **Bursts:** One tenant’s **scheduled send** or **big behavioural spike** can enqueue a large slice of that space in minutes. If that shares **one process** with **global event ingestion**, you risk **CPU and GC contention**, **thread pool starvation**, and **tail latency** on unrelated brands.
-- **Queues exist to absorb bursts:** A merged service removes the natural **backpressure boundary** (consumer lag on `ge.campaigns.outbound`, DLQ, scale-out of workers only). Everything becomes one heap and one release.
-
-**Takeaway for planning:** Merging does not remove the multiplication—it **hides** it until the whole system falls over together.
+**How this project is built today:** Different jobs run as **different programs**. They talk through **message queues** (RabbitMQ) and sometimes HTTP. Most APIs are **NestJS (TypeScript)**. **Scoring / AI** lives in **`ai-engine`, which is Python**—on purpose.
 
 ---
 
-## 2. Why 20–30 campaigns can “bombard” a unified stack
+## 1. One tenant can create a lot of work (it multiplies)
 
-If campaign evaluation, delivery, ingestion, and optional **per-player ML** all run in **one binary**:
+Picture **one casino (tenant)** with about **50,000 players** and **20–30 live campaigns** (emails, triggers, segments, schedules).
 
-- **No isolation:** A runaway segment refresh or a bad template loop ties up the same event loop / thread pool that serves **`POST /events`** and health checks.
-- **Cascading timeouts:** Slow **SMS/email providers** or **webhooks** block workers that you might have reused for “everything” in a monolith.
-- **Memory pressure:** Holding large in-memory structures for “all campaigns for all users” in one process is riskier than **sharding workers** by queue or by service.
-- **One deploy rolls the dice for everyone:** A campaign feature regression can take down **ingestion** for **all tenants**—unacceptable for a multi-tenant CRM.
+- The work is rarely “one small task.” In the heavy cases you must think about **many players** and **many campaigns** at the same time—roughly **players × campaigns** worth of checks when you run a full sweep or a big wave of events.
+- **Simple number example:** 50,000 × 25 ≈ **1.25 million** “did this player match this campaign?” style steps in one full pass. That is before retries, sending to multiple channels, or calling ML. (Real product logic may skip work—this is still useful for **capacity planning**.)
+- **Spikes:** A scheduled send or a sudden burst of player activity can create **a lot of work in a short time**. If that work runs in the **same process** as “receive events from every customer,” one busy tenant can **slow down or starve** everyone else.
+- **Queues help:** Work waits in a line (e.g. `ge.campaigns.outbound`) instead of piling into one program’s memory. If you merge everything, you **lose that cushion**—problems show up as **one big crash** instead of **a growing queue** you can watch and scale.
 
-Separate services let you **scale campaign-engine and channel-delivery** independently from **event-ingestion**, and throttle at **RabbitMQ + worker count** instead of at “hope the monolith survives.”
-
----
-
-## 3. Python AI engine vs NestJS: keep them separate on purpose
-
-| Factor | Implication |
-|--------|-------------|
-| **Runtime** | **Python** (`ai-engine`: scoring, feature extraction from ClickHouse/Postgres) vs **Node/NestJS** (ingestion, campaigns, delivery). Different **GC**, **concurrency model**, and **dependency trees**. |
-| **CPU / latency** | ML and batch scoring are often **CPU-bound** or **I/O-heavy to analytics stores**; mixing them into NestJS either **blocks the Node event loop** or forces awkward **worker thread / subprocess** bridges—you already have a dedicated Python service. |
-| **Shipping** | **Separate container** = smaller Nest images, **independent** Python version and **numpy/scipy** stack without bloating every API pod. |
-| **Scaling** | Scale **`ai-engine`** replicas for scoring load without scaling **every** Nest service. |
-
-Merging “everything” would mean either **dropping** the dedicated Python stack (reimplementing ML in TS—high cost) or **embedding** Python in Node (operational complexity, not simplification).
+**In one sentence:** Merging does not make the math smaller; it only **hides** it until the whole app struggles at once.
 
 ---
 
-## 4. What we recommend instead of a monolith
+## 2. Why many campaigns can “bombard” a single combined app
 
-- **Keep message boundaries** between facts (`ge.events.raw.v1`) and actions (`ge.campaigns`, `ge.campaigns.outbound`) so bursts **queue** instead of **blocking** ingest.
-- **Cap and schedule** heavy tenant work (per-brand limits, staggered segment runs, DLQ alerts)—easier when **delivery** and **evaluation** are observable separate services.
-- **Scale horizontally** the tier that is hot (e.g. more `channel-delivery` consumers vs more `event-ingestion` replicas) using metrics that are already **per service**.
-- **Treat `ai-engine` as an optional, scaled sidecar** to Nest services via HTTP + API key—not inline in the request path of raw ingestion unless you explicitly design async scoring.
+If **ingestion**, **campaign rules**, **sending email/SMS**, and **optional AI scoring** all lived in **one deployment**:
+
+- **Same workers do everything:** A bug, a slow loop, or a huge segment refresh can tie up the same threads that should answer **`POST /events`** and health checks.
+- **Slow outsiders become your problem:** Email and SMS providers and webhooks can be **slow or flaky**. In a monolith, waiting on them can **block** other work that should stay fast.
+- **Memory:** Keeping “all campaigns × all users” style state in **one** process is riskier than splitting work across **workers** or **services** that you can scale separately.
+- **One bad deploy hurts everyone:** A mistake in campaign code could take down **event ingestion for all tenants**—hard to justify in a multi-tenant product.
+
+**Separate services** let you add more **campaign** or **delivery** capacity without blindly scaling **ingestion**, and you throttle using **queues and worker counts** instead of hoping one server survives.
+
+---
+
+## 3. Python (`ai-engine`) vs NestJS—why not one box?
+
+- **Different languages, different strengths:** Python fits **data / ML / scoring** (reading ClickHouse, Postgres, running models). NestJS fits **APIs and real-time glue** for the rest of the platform.
+- **Heavy CPU work:** Scoring can burn CPU and time. Packing that into the same Node process either **slows every API** or forces **complicated workarounds** (extra processes, threads). You already have a **dedicated Python service**—use it.
+- **Smaller, simpler deploys:** Nest images stay lean; Python keeps its own **scientific libraries** without bloating every API container.
+- **Scale what is hot:** When scoring spikes, scale **`ai-engine`** replicas—not every Nest service at once.
+
+Putting “everything” in one app usually means **rebuilding ML in TypeScript** (expensive) or **running Python inside Node** (hard to operate). Neither is simpler than **two clear services**.
+
+---
+
+## 4. What to do instead of a monolith
+
+- **Keep the pipeline split:** Raw events flow in (e.g. `ge.events.raw.v1`); outbound sends go out on their own queues (e.g. `ge.campaigns` / `ge.campaigns.outbound`). Bursts **wait in the queue** instead of **blocking** ingestion.
+- **Limit and stagger heavy jobs:** Per-brand caps, staggered runs, and alerts on dead-letter queues are easier when **delivery** and **rules** are **separate** and **observable**.
+- **Scale the tier that is busy:** More workers for sends vs more for ingestion—each service has its own metrics.
+- **Call AI when it makes sense:** Use **`ai-engine` over HTTP** (with auth) for scoring; do not force every raw event through ML unless you design that **async** on purpose.
 
 ---
 
 ## 5. Related reading
 
-- [player-traffic-vs-campaign-architecture.md](./player-traffic-vs-campaign-architecture.md) — short bullet map of services and queues.
-- Root [README.md](../README.md) — rate limiting, module isolation.
+- [player-traffic-vs-campaign-architecture.md](./player-traffic-vs-campaign-architecture.md) — short map of services and queues.
+- Root [README.md](../README.md) — rate limits and module isolation.
 
 ---
 
-*Figures (50k users, 20–30 campaigns) are planning examples; tune with production metrics (queue depth, p95 latency, cost per evaluation).*
+*The 50k users and 20–30 campaign numbers are **examples for planning**. Replace them with real production metrics (queue depth, latency, cost per run) when you size infrastructure.*
