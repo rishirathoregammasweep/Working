@@ -189,7 +189,7 @@ flowchart TB
   subgraph state["State & analytics"]
     PS["PlayerStateService\nRedis player_state"]
     SN["SnapshotService\nPostgres player_snapshots"]
-    CV1["ConversionTracker.checkConversion\nPostgres campaign_conversions?"]
+    CV1["ConversionTracker.checkConversion\nPostgres campaign_conversions if eligible"]
   end
 
   subgraph eval["Trigger evaluation"]
@@ -202,8 +202,8 @@ flowchart TB
   subgraph out["Outbound fan-out"]
     CP["CampaignPublisherService\nper MatchedTrigger"]
     ABT["AbTestService.assignVariant"]
-    LOG["logDelivery →\ncampaign_delivery_logs"]
-    PUB["publish × N"]
+    LOG["logDelivery to campaign_delivery_logs"]
+    PUB["publish N times"]
   end
 
   subgraph mq["RabbitMQ"]
@@ -218,7 +218,7 @@ flowchart TB
   TE --> TRDB
   TE --> RSEQ
   TE --> AI
-  TE -->|"MatchedTrigger[]"| CP
+  TE -->|"MatchedTrigger array"| CP
   CP --> ABT
   CP --> LOG
   CP --> PUB
@@ -229,23 +229,23 @@ flowchart TB
 
 ```mermaid
 sequenceDiagram
-  participant Timer as Cron / setTimeout / runNow
+  participant Timer as Cron or setTimeout or runNow
   participant SS as SchedulerService
-  participant DB as Postgres scheduled_campaigns + campaigns
+  participant DB as Postgres schedules and campaigns
   participant PP as PlayerProfileClient
-  participant AMQP as RabbitMQ ge.campaigns
+  participant AMQP as RabbitMQ campaigns exchange
 
-  Timer->>SS: executeSchedule(scheduleId)
-  SS->>DB: find schedule + campaign
+  Timer->>SS: executeSchedule with scheduleId
+  SS->>DB: find schedule and campaign
   alt inactive or missing
     SS-->>Timer: return
   end
   SS->>DB: UPDATE status = running
-  SS->>PP: queryAll(brand + opt-in filters)
-  PP-->>SS: players[]
+  SS->>PP: queryAll brand and opt-in filters
+  PP-->>SS: return players array
   loop each player
     SS->>SS: deterministicBucket vs control_group_pct
-    SS->>AMQP: publish JSON (channels[], event_type scheduled)
+    SS->>AMQP: publish JSON with channels and event_type scheduled
   end
   SS->>DB: UPDATE status, last_run_at, last_run_count
 ```
@@ -254,7 +254,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-  participant Q as ge.events.raw.v1
+  participant Q as raw events queue
   participant EC as EventConsumerService
   participant PS as PlayerStateService
   participant SN as SnapshotService
@@ -264,32 +264,32 @@ sequenceDiagram
   participant CP as CampaignPublisherService
   participant DB as Postgres
   participant R as Redis
-  participant OUT as ge.campaigns outbound
+  participant OUT as outbound campaigns queue
 
   Q->>EC: deliver message
   EC->>EC: validateEventEnvelope
   EC->>PS: updateFromEvent
   PS->>R: SET player_state
-  EC-)SN: upsertFromState async
-  SN-)DB: upsert player_snapshots
+  EC-->>SN: upsertFromState async fire-and-forget
+  SN-->>DB: upsert player_snapshots
   EC->>CV: checkConversion
-  CV->>DB: SELECT logs, campaigns; INSERT conversions?
+  CV->>DB: SELECT logs and campaigns, may INSERT conversions
   EC->>JR: enrollFromEvent optional
-  EC->>TE: evaluate(envelope, playerState)
-  TE->>DB: SELECT triggers WHERE brand_id, event_type, active
+  EC->>TE: evaluate envelope and playerState
+  TE->>DB: SELECT active triggers by brand and event type
   loop each trigger definition
-    TE->>TE: conditions + optional sequence in Redis
+    TE->>TE: conditions and optional sequence in Redis
   end
-  TE-->>EC: [T1, T2, ... Tn]
+  TE-->>EC: MatchedTrigger list T1 through Tn
 
   loop i = 1 to n
-    EC->>CP: publishCampaign(Ti)
-    CP->>DB: load campaign; A/B assign
+    EC->>CP: publishCampaign on Ti
+    CP->>DB: load campaign and A/B assign
     alt not control group
       CP->>CV: logDelivery
       CV->>DB: INSERT campaign_delivery_logs
     end
-    CP->>OUT: one message (channels[] on Ti)
+    CP->>OUT: one message with channel list on Ti
   end
   EC->>Q: ack
 ```
@@ -303,7 +303,7 @@ flowchart LR
   end
 
   subgraph matched["MatchedTrigger"]
-    ARR["channels: [email, sms, push]"]
+    ARR["channels email sms push"]
   end
 
   subgraph msg["One CampaignOutboundMessage"]
