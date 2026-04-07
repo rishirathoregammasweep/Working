@@ -54,6 +54,163 @@ flowchart LR
   CH --> CCr --> OUT
 ```
 
+## UML diagrams
+
+The **PlantUML** blocks below are standard UML (component + sequence). Paste them into [PlantUML Live](https://www.plantuml.com/plantuml/uml) or use a VS Code / IDE PlantUML extension to render. The **Mermaid** sequence diagram is the same flow in a form many Markdown viewers render natively (including GitHub).
+
+### Component diagram (services, queues, data stores)
+
+```plantuml
+@startuml trigger-flow-components
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+actor "Casino app\nor BFF" as App
+
+package "event-ingestion" <<service>> {
+  [EventsController\n/ EventsService] as EI
+}
+
+package "campaign-engine" <<service>> {
+  [EventConsumerService] as EC
+  [PlayerStateService\nSnapshotService\nConversionTracker\nJourneyService] as PS
+  [TriggerEvaluatorService] as TE
+  [CampaignPublisherService] as CP
+}
+
+package "channel-delivery" <<service>> {
+  [CampaignConsumerService\n+ channel adapters] as CD
+}
+
+cloud "Message broker" {
+  queue "ge.events.raw.v1" as Qraw
+  queue "ge.campaigns.outbound" as Qout
+}
+
+database "PostgreSQL" as PG {
+  card "triggers, campaigns,\nplayer_snapshots,\njourneys, conversions,\ntracking…" as pgc
+}
+
+database "Redis" as RD {
+  card "idempotency,\nplayer_state,\ntrigger seq:*,\nthrottle" as rdc
+}
+
+database "ClickHouse" as CH {
+  card "events_raw,\nplayer_state,\nanalytics buffers" as chc
+}
+
+App --> EI : <<async>>\nHTTP POST event
+EI --> RD : idempotency
+EI --> CH : events_raw (+ optional player_state)
+EI --> Qraw : publish envelope
+
+Qraw --> EC : consume
+EC --> PS : update state,\nsnapshot, conversions,\njourneys
+PS --> RD : SET player_state
+PS --> PG : INSERT/UPDATE snapshots,\nconversions, enrollments
+EC --> TE : evaluate
+TE --> PG : <<read>> triggers,\ncampaigns
+TE --> RD : GET/SET seq:*\n(sequential triggers)
+TE --> CP : MatchedTrigger[]
+CP --> PG : <<read>> campaign;\nINSERT delivery_log\n(if not control)
+CP --> Qout : publish outbound\nmessage
+
+Qout --> CD : consume
+CD --> PG : contact, suppression,\ntracking tokens
+CD --> RD : throttle INCR
+CD --> CH : campaign.dispatched,\nemail.open/click
+CD --> App : SMS / email /\npush / …
+
+@enduml
+```
+
+### Sequence diagram (happy path: one event → one campaign send)
+
+```plantuml
+@startuml trigger-flow-sequence
+autonumber
+actor "Casino app" as App
+participant "event-ingestion" as EI
+participant "Redis\n(idempotency)" as R0
+participant "ClickHouse" as CH
+participant "ge.events.raw.v1" as Q1
+participant "campaign-engine\nEventConsumer" as CE
+participant "Redis\n(player_state)" as R1
+participant "PostgreSQL" as PG
+participant "TriggerEvaluator\n+ Publisher" as TE
+participant "ge.campaigns.outbound" as Q2
+participant "channel-delivery" as CD
+
+App -> EI: ingest EventEnvelope
+activate EI
+EI -> R0: checkAndSetIdempotency
+EI -> CH: insert events_raw
+EI -> Q1: publish
+deactivate EI
+
+Q1 -> CE: deliver message
+activate CE
+CE -> R1: SET player_state
+CE -> PG: upsert player_snapshots
+CE -> PG: checkConversion (read logs;\nmaybe INSERT conversion)
+CE -> PG: journey enroll (optional)
+CE -> TE: evaluate + publish
+activate TE
+TE -> PG: SELECT triggers
+TE -> R1: sequence state (if needed)
+TE -> PG: SELECT campaign, A/B;\nINSERT campaign_delivery_logs
+TE -> Q2: publish CampaignOutboundMessage
+deactivate TE
+deactivate CE
+
+Q2 -> CD: deliver message
+activate CD
+CD -> PG: load contact, suppression
+CD -> CD: render, dispatch channels
+CD -> CH: forward campaign.dispatched
+deactivate CD
+
+@enduml
+```
+
+### Sequence diagram (Mermaid — for Markdown preview)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor App as Casino app
+  participant EI as event-ingestion
+  participant R0 as Redis (idempotency)
+  participant CH as ClickHouse
+  participant Q1 as ge.events.raw.v1
+  participant CE as campaign-engine
+  participant R1 as Redis (player_state)
+  participant PG as PostgreSQL
+  participant TE as Triggers + publisher
+  participant Q2 as ge.campaigns.outbound
+  participant CD as channel-delivery
+
+  App->>EI: POST EventEnvelope
+  EI->>R0: idempotency SET
+  EI->>CH: insert events_raw
+  EI->>Q1: publish
+
+  Q1->>CE: consume
+  CE->>R1: SET player_state
+  CE->>PG: snapshot upsert
+  CE->>PG: conversions / journeys (optional)
+  CE->>TE: evaluate + publish
+  TE->>PG: read triggers, campaigns
+  TE->>R1: seq state (sequential triggers)
+  TE->>PG: insert delivery_log (non-control)
+  TE->>Q2: publish outbound
+
+  Q2->>CD: consume
+  CD->>PG: contact, suppression, tracking
+  CD->>CH: campaign.dispatched (async)
+  CD-->>App: channel sends (email, SMS, …)
+```
+
 ## When Postgres, Redis, and ClickHouse write
 
 Writes are listed in roughly the order they happen along the path. Some steps are **reads only** (for example loading active triggers); those are noted briefly so it is clear where the database is touched.
