@@ -54,6 +54,68 @@ flowchart LR
   CH --> CCr --> OUT
 ```
 
+## When Postgres, Redis, and ClickHouse write
+
+Writes are listed in roughly the order they happen along the path. Some steps are **reads only** (for example loading active triggers); those are noted briefly so it is clear where the database is touched.
+
+### 1. Event ingestion (`event-ingestion`)
+
+| Store | What happens |
+|--------|----------------|
+| **Redis** | **Idempotency:** `checkAndSetIdempotency` records the `(brand_id, idempotency_key)` so duplicate HTTP submits are rejected before side effects. |
+| **ClickHouse** | **`events_raw`:** each accepted envelope is inserted for analytics and raw replay. |
+| **ClickHouse** | **`player_state` (optional):** after the raw insert, a fire-and-forget path may insert a row for **deposit / bet / session / registration**-style events (aggregated counters in ClickHouse; separate from Redis player state in campaign-engine). |
+| **RabbitMQ** | Publish to the raw events queue and profile-update stream (not DB/Redis/CH, but part of the same ingest step). |
+
+### 2. Campaign engine (`campaign-engine`, one message from `ge.events.raw.v1`)
+
+| Store | What happens |
+|--------|----------------|
+| **Redis** | **`player_state:{brand_id}:{player_id}`:** merged state is **SET** with TTL after each event (`PlayerStateService.updateFromEvent`). This is what trigger conditions use. |
+| **Postgres** | **`player_snapshots`:** **insert** on first seen player, else **update** in place (`SnapshotService.upsertFromState`) — async/non-blocking relative to ack in practice but still part of processing. |
+| **Postgres** | **Conversion tracking:** **reads** `campaign_delivery_logs` and `campaigns`; if the event matches a campaign’s conversion type inside the attribution window, **`campaign_conversions`** gets an **insert** (`INSERT … ON CONFLICT DO NOTHING`). |
+| **Postgres** | **Journeys (optional):** if a journey matches the event and entry rules, **`journey_enrollments`** may be **inserted** or prior rows **deleted/updated** (`JourneyService.enrollFromEvent`). |
+| **Postgres** | **Triggers:** **read** active rows from **`triggers`** for `brand_id` + `event_type` (no write on evaluate). |
+| **Redis** | **Sequential triggers:** keys `seq:{brand_id}:{player_id}:{sequence_id}` are **SET** / **DEL** as steps complete (`TriggerEvaluatorService`). |
+| **Postgres** | **Campaign publish:** **read** `campaigns` (and A/B logic). When the player is **not** in the control group, **`campaign_delivery_logs`** gets a **save** (`ConversionTrackerService.logDelivery`) so later conversions can be attributed. |
+| **Postgres** | **Conversions:** no extra write at publish beyond the delivery log above; conversion rows appear on **later** events when `checkConversion` matches. |
+
+### 3. Channel delivery (`channel-delivery`, outbound message)
+
+| Store | What happens |
+|--------|----------------|
+| **Postgres** | **Email tracking:** when email HTML is instrumented, **open/click tokens** are **inserted** into the tracking table (`TrackingService.createOpenToken` / `createClickToken`). |
+| **Redis** | **Send throttle:** if daily caps apply, counters may be **INCR** / **EXPIRE** (and **DECR** on failure paths) per player/channel (`SendThrottleService`). |
+| **ClickHouse** | **`events_raw_buffer`:** after dispatch, a **`campaign.dispatched`** row is forwarded for analytics (`CampaignEventForwarderService` → non-blocking). |
+| **Postgres** | **Email opens/clicks:** when a tracking URL is hit, **`fired_at`** is **updated** on the token row; then **ClickHouse** receives **`email.opened`** / **`email.clicked`** via the same forwarder pattern. |
+
+### Summary diagram (storage touchpoints)
+
+```mermaid
+flowchart TB
+  subgraph ingest["event-ingestion"]
+    R1[(Redis idempotency)]
+    CH1[(CH events_raw)]
+    CH1b[(CH player_state optional)]
+  end
+
+  subgraph ce["campaign-engine"]
+    R2[(Redis player_state)]
+    PG1[(PG player_snapshots)]
+    PG2[(PG conversions + delivery logs + journeys)]
+    R3[(Redis seq: triggers)]
+    PG3[(PG triggers read, campaigns read)]
+  end
+
+  subgraph cd["channel-delivery"]
+    PG4[(PG email tracking)]
+    R4[(Redis throttle)]
+    CH2[(CH campaign.dispatched + opens/clicks)]
+  end
+
+  ingest --> ce --> cd
+```
+
 ## Multiple channels
 
 ### Where channels are defined
@@ -87,5 +149,10 @@ Channel-delivery routes each channel name to the appropriate integration (email 
 ## Related code (for maintainers)
 
 - Ingest and publish to raw queue: `services/event-ingestion/src/events/events.service.ts`, `rabbitmq.service.ts`
+- ClickHouse on ingest: `services/event-ingestion/src/events/clickhouse.service.ts` (`events_raw`, optional `player_state`)
+- Redis idempotency: `services/event-ingestion/src/events/redis.service.ts` (used from `events.service.ts`)
 - Consume events, evaluate triggers, publish campaigns: `services/campaign-engine/src/campaign/event-consumer.service.ts`, `trigger-evaluator.service.ts`, `campaign-publisher.service.ts`
+- Redis player state: `services/campaign-engine/src/player-state/player-state.service.ts`; sequential triggers: `trigger-evaluator.service.ts`
+- Postgres snapshots and conversions: `services/campaign-engine/src/snapshot/snapshot.service.ts`, `conversions/conversion-tracker.service.ts`
 - Multi-channel dispatch: `services/channel-delivery/src/consumer/campaign-consumer.service.ts` (`dispatchWaterfall`, `dispatchConcurrent`, `sendChannel`)
+- ClickHouse forward from delivery: `services/channel-delivery/src/analytics/campaign-event-forwarder.service.ts`, `tracking/tracking.service.ts`
